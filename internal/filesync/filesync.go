@@ -169,6 +169,16 @@ func (o *Orchestrator) HandleFileMeta(pkt models.Packet, from *net.UDPAddr) {
 		Timestamp: time.Now().UnixNano(),
 	}
 
+	// If this hash has already failed before, keep it in manual mode and do not
+	// auto-download it again on every history replay.
+	if prev, found, err := o.store.GetFile(rec.FileHash); err != nil {
+		log.Printf("[sync] db read existing file record: %v", err)
+	} else if found && prev.Status == models.FileStatusFailed {
+		log.Printf("[sync] skip auto-download for previously failed hash %s (%s); use --pull for manual retry",
+			rec.FileHash, rec.FileName)
+		return
+	}
+
 	if o.isManualOnlyForAuto(rec.SenderID, rec.FileName) {
 		// Persist metadata for visibility/history, but do not auto-download.
 		rec.Status = models.FileStatusFailed
