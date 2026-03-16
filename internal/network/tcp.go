@@ -35,6 +35,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -199,6 +200,7 @@ func (s *TCPServer) handleConn(ctx context.Context, conn net.Conn) {
 		s.writeErrorResponse(conn, fmt.Sprintf("bad request: %v", err))
 		return
 	}
+	req.FileHash = strings.ToLower(strings.TrimSpace(req.FileHash))
 	if req.FileHash == "" {
 		s.writeErrorResponse(conn, "file_hash is required")
 		return
@@ -341,6 +343,11 @@ func DownloadFile(
 	fileHash string,
 	destDir string,
 ) (*DownloadResult, error) {
+	fileHash = strings.ToLower(strings.TrimSpace(fileHash))
+	if fileHash == "" {
+		return nil, fmt.Errorf("tcp download: empty file hash")
+	}
+
 	// ── 1. Connect ────────────────────────────────────────────────────────────
 
 	dialer := &net.Dialer{}

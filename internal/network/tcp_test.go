@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -101,6 +102,79 @@ func TestTCPServer_HandleConn_UsesSnapshotSizeAndStableContent(t *testing.T) {
 	gotHash := sha256.Sum256(body)
 	if hex.EncodeToString(gotHash[:]) != rec.FileHash {
 		t.Fatalf("hash mismatch after transfer: got %s want %s", hex.EncodeToString(gotHash[:]), rec.FileHash)
+	}
+
+	<-done
+}
+
+func TestTCPServer_HandleConn_AcceptsUppercaseFileHashRequest(t *testing.T) {
+	t.Parallel()
+
+	tempDir := t.TempDir()
+	store, err := storage.Open(filepath.Join(tempDir, "db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	content := []byte("echo-send-tcp-hash-case-test")
+	localPath := filepath.Join(tempDir, "case.txt")
+	if err := os.WriteFile(localPath, content, 0o644); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+
+	h := sha256.Sum256(content)
+	hash := hex.EncodeToString(h[:])
+
+	rec := models.FileRecord{
+		FileHash:  hash,
+		FileName:  "case.txt",
+		FileSize:  int64(len(content)),
+		LocalPath: localPath,
+		Status:    models.FileStatusSeeding,
+		Timestamp: time.Now().UnixNano(),
+	}
+	if err := store.InsertFileRecord(rec); err != nil {
+		t.Fatalf("insert file record: %v", err)
+	}
+
+	srv := NewTCPServer(&config.Config{MaxConcurrentSyncs: 1}, store)
+
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.handleConn(context.Background(), serverConn)
+	}()
+
+	reqData, _ := json.Marshal(tcpRequest{FileHash: strings.ToUpper(hash)})
+	reqData = append(reqData, '\n')
+	if _, err := clientConn.Write(reqData); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	reader := bufio.NewReader(clientConn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read response header: %v", err)
+	}
+
+	var resp tcpResponse
+	if err := json.Unmarshal([]byte(line), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if !resp.OK {
+		t.Fatalf("server returned error: %s", resp.Error)
+	}
+
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !bytes.Equal(body, content) {
+		t.Fatalf("body mismatch: got %q want %q", body, content)
 	}
 
 	<-done

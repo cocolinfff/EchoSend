@@ -157,6 +157,17 @@ func (o *Orchestrator) HandleFileMeta(pkt models.Packet, from *net.UDPAddr) {
 	log.Printf("[sync] received FILE_META: %s (%s) from %s",
 		meta.FileName, humanSize(meta.FileSize), pkt.SenderID)
 
+	meta.FileHash = strings.ToLower(strings.TrimSpace(meta.FileHash))
+	if meta.FileHash == "" {
+		log.Printf("[sync] malformed FILE_META from %s: empty file hash", pkt.SenderID)
+		return
+	}
+
+	recTs := pkt.Timestamp
+	if recTs == 0 {
+		recTs = time.Now().UnixNano()
+	}
+
 	// Persist the record (KNOWN state) so --history shows it immediately.
 	rec := models.FileRecord{
 		FileHash:  meta.FileHash,
@@ -166,7 +177,7 @@ func (o *Orchestrator) HandleFileMeta(pkt models.Packet, from *net.UDPAddr) {
 		SenderIP:  pkt.SenderIP,
 		SenderTCP: meta.TCPPort,
 		Status:    models.FileStatusKnown,
-		Timestamp: time.Now().UnixNano(),
+		Timestamp: recTs,
 	}
 
 	// If this hash has already failed before, keep it in manual mode and do not
@@ -226,7 +237,7 @@ func (o *Orchestrator) HandleFileMeta(pkt models.Packet, from *net.UDPAddr) {
 // local history metadata. The operation is asynchronous and returns once the
 // download goroutine has been queued.
 func (o *Orchestrator) PullFileByHash(fileHash string) error {
-	fileHash = strings.TrimSpace(fileHash)
+	fileHash = strings.ToLower(strings.TrimSpace(fileHash))
 	if fileHash == "" {
 		return ErrManualPullNotFound
 	}

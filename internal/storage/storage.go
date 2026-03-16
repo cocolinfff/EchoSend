@@ -17,12 +17,17 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
 
 	"p2p-sync/internal/models"
 )
+
+func normalizeFileHash(fileHash string) string {
+	return strings.ToLower(strings.TrimSpace(fileHash))
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bucket names
@@ -234,16 +239,49 @@ var ErrDuplicateFile = errors.New("storage: file already complete or seeding")
 func (s *Store) InsertFileRecord(rec models.FileRecord) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketFiles)
-		key := []byte(rec.FileHash)
+
+		normHash := normalizeFileHash(rec.FileHash)
+		if normHash == "" {
+			return fmt.Errorf("storage: empty file hash")
+		}
+		rec.FileHash = normHash
+		key := []byte(normHash)
 
 		existing := b.Get(key)
 		if existing != nil {
 			var prev models.FileRecord
 			if err := json.Unmarshal(existing, &prev); err == nil {
+				if prev.Timestamp > 0 {
+					rec.Timestamp = prev.Timestamp
+				}
 				if prev.Status == models.FileStatusComplete ||
 					prev.Status == models.FileStatusSeeding {
 					return ErrDuplicateFile
 				}
+			}
+		} else {
+			// Backward compatibility for legacy uppercase/mixed-case keys.
+			c := b.Cursor()
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				if !strings.EqualFold(string(k), normHash) {
+					continue
+				}
+
+				var prev models.FileRecord
+				if err := json.Unmarshal(v, &prev); err == nil {
+					if prev.Timestamp > 0 {
+						rec.Timestamp = prev.Timestamp
+					}
+					if prev.Status == models.FileStatusComplete ||
+						prev.Status == models.FileStatusSeeding {
+						return ErrDuplicateFile
+					}
+				}
+
+				if err := b.Delete(k); err != nil {
+					return err
+				}
+				break
 			}
 		}
 
@@ -261,11 +299,23 @@ func (s *Store) InsertFileRecord(rec models.FileRecord) error {
 func (s *Store) UpdateFileStatus(fileHash string, status models.FileStatus, localPath string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketFiles)
-		key := []byte(fileHash)
+		normHash := normalizeFileHash(fileHash)
+		key := []byte(normHash)
 
 		v := b.Get(key)
 		if v == nil {
-			return nil // record not found – benign race condition, ignore
+			// Fallback for legacy mixed-case keys.
+			c := b.Cursor()
+			for k, vv := c.First(); k != nil; k, vv = c.Next() {
+				if strings.EqualFold(string(k), normHash) {
+					key = append([]byte(nil), k...)
+					v = vv
+					break
+				}
+			}
+			if v == nil {
+				return nil // record not found – benign race condition, ignore
+			}
 		}
 
 		var rec models.FileRecord
@@ -274,6 +324,7 @@ func (s *Store) UpdateFileStatus(fileHash string, status models.FileStatus, loca
 		}
 
 		rec.Status = status
+		rec.FileHash = normHash
 		if localPath != "" {
 			rec.LocalPath = localPath
 		}
@@ -282,7 +333,15 @@ func (s *Store) UpdateFileStatus(fileHash string, status models.FileStatus, loca
 		if err != nil {
 			return err
 		}
-		return b.Put(key, data)
+		if err := b.Put([]byte(normHash), data); err != nil {
+			return err
+		}
+		if string(key) != normHash {
+			if err := b.Delete(key); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 
@@ -291,12 +350,28 @@ func (s *Store) GetFile(fileHash string) (models.FileRecord, bool, error) {
 	var rec models.FileRecord
 	found := false
 	err := s.db.View(func(tx *bolt.Tx) error {
-		v := tx.Bucket(bucketFiles).Get([]byte(fileHash))
+		normHash := normalizeFileHash(fileHash)
+		b := tx.Bucket(bucketFiles)
+		v := b.Get([]byte(normHash))
+		if v == nil {
+			// Fallback for legacy mixed-case keys.
+			c := b.Cursor()
+			for k, vv := c.First(); k != nil; k, vv = c.Next() {
+				if strings.EqualFold(string(k), normHash) {
+					v = vv
+					break
+				}
+			}
+		}
 		if v == nil {
 			return nil
 		}
 		found = true
-		return json.Unmarshal(v, &rec)
+		if err := json.Unmarshal(v, &rec); err != nil {
+			return err
+		}
+		rec.FileHash = normHash
+		return nil
 	})
 	return rec, found, err
 }
@@ -358,7 +433,24 @@ func (s *Store) ListFilesByStatus(status models.FileStatus) ([]models.FileRecord
 // DeleteFile removes a file record (e.g. after a failed download is cleaned up).
 func (s *Store) DeleteFile(fileHash string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketFiles).Delete([]byte(fileHash))
+		normHash := normalizeFileHash(fileHash)
+		b := tx.Bucket(bucketFiles)
+		if normHash == "" {
+			return nil
+		}
+
+		if v := b.Get([]byte(normHash)); v != nil {
+			return b.Delete([]byte(normHash))
+		}
+
+		// Legacy mixed-case fallback.
+		c := b.Cursor()
+		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+			if strings.EqualFold(string(k), normHash) {
+				return b.Delete(k)
+			}
+		}
+		return nil
 	})
 }
 
