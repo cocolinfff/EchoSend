@@ -31,7 +31,7 @@ storage_dir: "./data"
 static_peers: []
 
 # 心跳发送间隔（秒）
-heartbeat_interval_sec: 5
+heartbeat_interval_sec: 15
 
 # Gossip 已见包缓存过期时间（秒），用于防止无限重放
 seen_packet_ttl_sec: 300
