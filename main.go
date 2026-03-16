@@ -18,6 +18,10 @@
 //	echosend --history [--limit N] [--json]
 //	echosend status
 //
+// # Manually pull/retry a file by hash:
+//
+//	echosend --pull <sha256>
+//
 // # Add a static peer at runtime:
 //
 //	echosend --add 192.168.2.100
@@ -97,6 +101,8 @@ func run(args []string) int {
 		return cmdHistory(args[1:])
 	case "--add":
 		return cmdAdd(args[1:])
+	case "--pull":
+		return cmdPull(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown command %q\n\n", args[0])
 		printUsage()
@@ -470,6 +476,58 @@ func cmdAdd(args []string) int {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// --pull
+// ─────────────────────────────────────────────────────────────────────────────
+
+func cmdPull(args []string) int {
+	fs := flag.NewFlagSet("--pull", flag.ExitOnError)
+	cfgPath := fs.String("config", defaultConfigPath(), "path to config.yaml")
+	ipcPort := fs.Int("ipc-port", 0, "override IPC port")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage:\n")
+		fmt.Fprintf(os.Stderr, "  echosend --pull <sha256-file-hash>\n\n")
+		fmt.Fprintf(os.Stderr, "Trigger a manual pull/retry for a file already present in history metadata.\n\n")
+		fmt.Fprintf(os.Stderr, "Flags:\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintf(os.Stderr, "error: --pull requires exactly one file hash argument\n\n")
+		fs.Usage()
+		return 1
+	}
+
+	fileHash := strings.TrimSpace(fs.Arg(0))
+	if fileHash == "" {
+		fmt.Fprintf(os.Stderr, "error: file hash must not be empty\n")
+		return 1
+	}
+
+	port, err := resolveIPCPort(*cfgPath, *ipcPort)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
+	client := ipc.NewClient(port)
+	if pingErr := client.Ping(); pingErr != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", pingErr)
+		return 1
+	}
+
+	if err := client.PullFileByHash(fileHash); err != nil {
+		fmt.Fprintf(os.Stderr, "error: pull file: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("✓ Manual pull scheduled for hash: %s\n", fileHash)
+	fmt.Println("  Use --history to track download status changes.")
+	return 0
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // History rendering
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -581,6 +639,7 @@ USAGE:
 
   echosend --history [flags]           Show message + file history
   echosend --add <ip|cidr> [flags]     Add a static peer / CIDR block
+	echosend --pull <sha256> [flags]     Manually pull/retry a file download
 
 DAEMON FLAGS (all optional – sane defaults apply):
   --config   path   Config file path; created with defaults if absent
@@ -622,6 +681,9 @@ EXAMPLES:
 
   # Add a cross-subnet peer:
   echosend --add 10.10.0.0/24
+
+	# Retry a file download by hash:
+	echosend --pull 3f8a1c09b2d70b7e2dbd7f9fbd3e2cce8e8b6c63f2a4e3e0fd3af1c8a9d4b2ef
 
 `, version)
 }

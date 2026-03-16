@@ -30,6 +30,7 @@ EchoSend 是一个用 **Go** 编写的单文件二进制工具，无需服务器
 - [CLI 参考](#cli-参考)
   - [daemon — 启动守护进程](#daemon--启动守护进程)
   - [--send — 发送消息或文件](#--send--发送消息或文件)
+  - [--pull — 手动重拉文件](#--pull--手动重拉文件)
   - [--history — 查看历史](#--history--查看历史)
   - [--add — 添加静态节点](#--add--添加静态节点)
   - [status — 查看节点状态](#status--查看节点状态)
@@ -134,6 +135,9 @@ echosend --send -m "hello everyone"
 
 # 分享一个文件（其他节点若文件 ≤ 100 MiB 则自动下载）
 echosend --send -f ./report.pdf
+
+# 手动重拉/重试某个历史文件（当自动下载跳过或失败时）
+echosend --pull <sha256-file-hash>
 
 # 查看消息和文件历史
 echosend --history
@@ -268,6 +272,35 @@ echosend --send -m "已部署 v2.3.1，请同步"
 echosend --send -f ./dist/firmware-v2.3.1.bin
 echosend --send -f ./logs.tar.gz --ipc-port 8879   # 多实例场景
 ```
+
+---
+
+### `--pull` — 手动重拉文件
+
+```
+echosend --pull <sha256-file-hash>
+```
+
+用于手动触发“按 Hash 重新拉取远端文件”，典型场景：
+
+- 文件超过 `auto_download_max_mb`，被自动下载策略跳过
+- 曾经下载失败（`[fail]`）需要重试
+- 新设备刚同步到历史元数据但本地还没有文件
+
+| Flag | 说明 |
+|------|------|
+| `--ipc-port` | 覆盖 IPC 端口（无需 config 文件） |
+| `--config` | 指定 config 文件读取 IPC 端口 |
+
+**示例：**
+
+```bash
+# 先通过 history 获取 hash，再手动重拉
+echosend --history --limit 50
+echosend --pull 3f8a1c09b2d70b7e2dbd7f9fbd3e2cce8e8b6c63f2a4e3e0fd3af1c8a9d4b2ef
+```
+
+> `--pull` 是触发命令，下载在 daemon 侧异步执行。可用 `echosend --history` 观察状态从 `[known]/[fail]` 变为 `[dl..]`、`[done]` 或 `[seed]`。
 
 ---
 
@@ -524,6 +557,22 @@ GOOS=darwin GOARCH=arm64 go build -ldflags "-s -w" -o echosend-darwin-arm64 .
 # Windows x86-64
 GOOS=windows GOARCH=amd64 go build -ldflags "-s -w" -o echosend-windows-amd64.exe .
 ```
+
+### GitHub Actions 手动发版（自动 +0.0.1）
+
+仓库内置 workflow：`.github/workflows/release-manual.yml`
+
+- 触发方式：GitHub Actions 页面手动触发 `Manual Build and Release`
+- 版本策略：读取最新 `vX.Y.Z` tag，自动发布下一个补丁版本 `vX.Y.(Z+1)`
+- 首次无 tag 时从 `v0.0.1` 开始
+- 产物：
+  - `echosend-win64.exe`
+  - `echosend-win32.exe`
+  - `echosend-linux64`
+  - `echosend-linux32`
+  - `SHA256SUMS.txt`
+
+Release 会自动上传以上文件并生成 release notes。
 
 ### 使用 Makefile 一键构建全平台
 
