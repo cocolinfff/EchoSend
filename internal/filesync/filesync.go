@@ -1,0 +1,461 @@
+// Package filesync implements the file synchronisation orchestrator for the
+// EchoSend daemon.
+//
+// Responsibilities:
+//
+//  1. React to incoming FILE_META gossip packets and decide whether to trigger
+//     an automatic download based on the configured AutoDownloadMaxMB ceiling.
+//
+//  2. Enforce the MaxConcurrentSyncs limit via a buffered-channel semaphore so
+//     that low-end devices are never overwhelmed by simultaneous downloads.
+//
+//  3. Execute each download using the streaming TCP client (network.DownloadFile)
+//     which keeps RAM usage O(copyBufSize) regardless of file size.
+//
+//  4. After a successful download, update the database record to COMPLETE and
+//     promote this node to a seeder so the file propagates further.
+//
+//  5. For files the local user explicitly sends (via CLI), compute the SHA-256
+//     hash in a single streaming pass (no full-file buffering) and broadcast
+//     a FILE_META gossip packet so peers can pull the file.
+//
+// Thread safety: all exported methods are safe for concurrent use.
+package filesync
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"p2p-sync/internal/config"
+	"p2p-sync/internal/models"
+	"p2p-sync/internal/network"
+	"p2p-sync/internal/storage"
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+const (
+	// hashBufSize is the read-buffer size used when computing the SHA-256 of a
+	// local file before broadcasting it.  64 KiB balances syscall overhead
+	// against stack pressure.
+	hashBufSize = 64 * 1024
+
+	// downloadRetryDelay is the minimum pause before retrying a failed download.
+	downloadRetryDelay = 5 * time.Second
+
+	// maxDownloadRetries is how many times a single file download is retried
+	// before the record is marked FAILED and abandoned.
+	maxDownloadRetries = 3
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sender interface
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GossipSender is implemented by network.UDPEngine.  The interface is defined
+// here (rather than importing the concrete type) to break the import cycle
+// between the filesync and network packages and to simplify unit testing.
+type GossipSender interface {
+	Send(pkt models.Packet) error
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Orchestrator
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Orchestrator manages the complete lifecycle of file synchronisation:
+// receiving metadata, scheduling downloads, verifying integrity and seeding.
+type Orchestrator struct {
+	cfg    *config.Config
+	store  *storage.Store
+	gossip GossipSender
+
+	// sem is a counting semaphore (buffered channel) that caps the number of
+	// concurrent file downloads.  Acquiring = receive from channel;
+	// releasing = send to channel.
+	sem chan struct{}
+
+	// inFlight tracks the set of file hashes currently being downloaded so we
+	// never start two goroutines for the same file.
+	inFlightMu sync.Mutex
+	inFlight   map[string]struct{}
+}
+
+// New creates an Orchestrator.  gossip may be nil during unit tests (no
+// broadcasts will be sent).
+func New(cfg *config.Config, store *storage.Store, gossip GossipSender) *Orchestrator {
+	cap := cfg.MaxConcurrentSyncs
+	if cap <= 0 {
+		cap = 3
+	}
+
+	// Pre-fill the semaphore channel so each slot is immediately available.
+	sem := make(chan struct{}, cap)
+	for i := 0; i < cap; i++ {
+		sem <- struct{}{}
+	}
+
+	return &Orchestrator{
+		cfg:      cfg,
+		store:    store,
+		gossip:   gossip,
+		sem:      sem,
+		inFlight: make(map[string]struct{}),
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HandleFileMeta – react to an incoming FILE_META gossip packet
+// ─────────────────────────────────────────────────────────────────────────────
+
+// HandleFileMeta is the PacketHandler callback registered with the UDP engine
+// for FILE_META packets.  It is called from a goroutine inside the UDP engine
+// and must return quickly; any heavy work is dispatched asynchronously.
+func (o *Orchestrator) HandleFileMeta(pkt models.Packet, from *net.UDPAddr) {
+	var meta models.FileMeta
+	if err := json.Unmarshal(pkt.Payload, &meta); err != nil {
+		log.Printf("[sync] malformed FILE_META from %s: %v", pkt.SenderID, err)
+		return
+	}
+
+	log.Printf("[sync] received FILE_META: %s (%s) from %s",
+		meta.FileName, humanSize(meta.FileSize), pkt.SenderID)
+
+	// Persist the record (KNOWN state) so --history shows it immediately.
+	rec := models.FileRecord{
+		FileHash:  meta.FileHash,
+		FileName:  meta.FileName,
+		FileSize:  meta.FileSize,
+		SenderID:  pkt.SenderID,
+		SenderIP:  pkt.SenderIP,
+		SenderTCP: meta.TCPPort,
+		Status:    models.FileStatusKnown,
+		Timestamp: time.Now().UnixNano(),
+	}
+
+	if err := o.store.InsertFileRecord(rec); err != nil {
+		if err == storage.ErrDuplicateFile {
+			log.Printf("[sync] already have %s – skipping", meta.FileName)
+			return
+		}
+		log.Printf("[sync] db insert file meta: %v", err)
+		// Continue: even if persistence failed, we can still try to download.
+	}
+
+	// Auto-download decision:
+	//   • AutoDownloadMaxMB == 0  → disabled
+	//   • FileSize > threshold    → skip (user must pull manually)
+	if o.cfg.AutoDownloadMaxMB == 0 {
+		log.Printf("[sync] auto-download disabled, skipping %s", meta.FileName)
+		return
+	}
+	if meta.FileSize > o.cfg.AutoDownloadMaxBytes() {
+		log.Printf("[sync] %s (%s) exceeds auto-download limit (%d MB), skipping",
+			meta.FileName, humanSize(meta.FileSize), o.cfg.AutoDownloadMaxMB)
+		return
+	}
+
+	// Ensure we don't start a duplicate goroutine for the same hash.
+	o.inFlightMu.Lock()
+	if _, already := o.inFlight[meta.FileHash]; already {
+		o.inFlightMu.Unlock()
+		return
+	}
+	o.inFlight[meta.FileHash] = struct{}{}
+	o.inFlightMu.Unlock()
+
+	// Determine the source address for the TCP pull.
+	sourceIP := pkt.SenderIP
+	if sourceIP == "" && from != nil {
+		sourceIP = from.IP.String()
+	}
+	peerAddr := fmt.Sprintf("%s:%d", sourceIP, meta.TCPPort)
+
+	// Dispatch download asynchronously.
+	go o.downloadWithRetry(context.Background(), rec, peerAddr)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Download pipeline
+// ─────────────────────────────────────────────────────────────────────────────
+
+// downloadWithRetry attempts to download rec from peerAddr up to
+// maxDownloadRetries times, with an exponential-ish back-off between attempts.
+// It acquires the semaphore before each attempt so the cap is always respected.
+func (o *Orchestrator) downloadWithRetry(ctx context.Context, rec models.FileRecord, peerAddr string) {
+	defer func() {
+		// Always release the in-flight tracking entry, regardless of outcome.
+		o.inFlightMu.Lock()
+		delete(o.inFlight, rec.FileHash)
+		o.inFlightMu.Unlock()
+	}()
+
+	var lastErr error
+	for attempt := 1; attempt <= maxDownloadRetries; attempt++ {
+		// Back-off between retries.
+		if attempt > 1 {
+			backoff := time.Duration(attempt-1) * downloadRetryDelay
+			log.Printf("[sync] retry %d/%d for %s in %s (last error: %v)",
+				attempt, maxDownloadRetries, rec.FileName, backoff, lastErr)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+		}
+
+		// Acquire a semaphore slot.
+		select {
+		case <-o.sem:
+			// Slot acquired.
+		case <-ctx.Done():
+			return
+		}
+
+		err := o.executeDownload(ctx, rec, peerAddr)
+		o.sem <- struct{}{} // release slot unconditionally
+
+		if err == nil {
+			return // success
+		}
+		lastErr = err
+		log.Printf("[sync] download attempt %d/%d failed for %s: %v",
+			attempt, maxDownloadRetries, rec.FileName, err)
+	}
+
+	// All retries exhausted – mark as FAILED.
+	log.Printf("[sync] giving up on %s after %d attempts", rec.FileName, maxDownloadRetries)
+	if err := o.store.UpdateFileStatus(rec.FileHash, models.FileStatusFailed, ""); err != nil {
+		log.Printf("[sync] db update status FAILED: %v", err)
+	}
+}
+
+// executeDownload performs one download attempt for rec from peerAddr.
+// It marks the record DOWNLOADING before starting, calls network.DownloadFile
+// for the actual streaming transfer, and on success promotes to COMPLETE/SEEDING.
+func (o *Orchestrator) executeDownload(ctx context.Context, rec models.FileRecord, peerAddr string) error {
+	// Mark as DOWNLOADING in the database so the status is visible via --history.
+	if err := o.store.UpdateFileStatus(rec.FileHash, models.FileStatusDownloading, ""); err != nil {
+		log.Printf("[sync] db update DOWNLOADING: %v", err)
+		// Non-fatal: continue with the download.
+	}
+
+	log.Printf("[sync] downloading %s from %s", rec.FileName, peerAddr)
+
+	result, err := network.DownloadFile(ctx, peerAddr, rec.FileHash, o.cfg.StorageDir)
+	if err != nil {
+		// DownloadFile already deleted the partial file on error, so just
+		// update the status and propagate.
+		if dbErr := o.store.UpdateFileStatus(rec.FileHash, models.FileStatusFailed, ""); dbErr != nil {
+			log.Printf("[sync] db update FAILED: %v", dbErr)
+		}
+		return err
+	}
+
+	// ── Promote to COMPLETE and become a seeder ───────────────────────────────
+
+	if err := o.store.UpdateFileStatus(rec.FileHash, models.FileStatusSeeding, result.LocalPath); err != nil {
+		log.Printf("[sync] db update SEEDING: %v", err)
+	}
+
+	log.Printf("[sync] ✓ %s saved to %s (%s)",
+		result.FileName, result.LocalPath, humanSize(result.FileSize))
+
+	// Re-broadcast the FILE_META so this node propagates the file further.
+	o.rebroadcastFileMeta(rec, result.LocalPath)
+
+	return nil
+}
+
+// rebroadcastFileMeta announces a newly completed download to the gossip mesh
+// so other nodes learn that this node is now a seeder.
+func (o *Orchestrator) rebroadcastFileMeta(rec models.FileRecord, localPath string) {
+	if o.gossip == nil {
+		return
+	}
+
+	meta := models.FileMeta{
+		FileName: filepath.Base(localPath),
+		FileSize: rec.FileSize,
+		FileHash: rec.FileHash,
+		TCPPort:  o.cfg.DaemonPortTCP,
+	}
+	payload, err := json.Marshal(meta)
+	if err != nil {
+		log.Printf("[sync] rebroadcast marshal: %v", err)
+		return
+	}
+
+	pkt := models.Packet{
+		PacketID:  network.NewPacketID(),
+		SenderID:  o.cfg.NodeID,
+		SenderIP:  "", // filled in by UDPEngine.Send
+		Type:      models.PacketFileMeta,
+		Payload:   payload,
+		Timestamp: time.Now().UnixNano(),
+	}
+
+	if err := o.gossip.Send(pkt); err != nil {
+		log.Printf("[sync] rebroadcast FILE_META: %v", err)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PublishFile – called by the CLI --send -f path handler (via IPC)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// PublishFile computes the SHA-256 hash of the file at localPath using a
+// single streaming pass (no full-file buffering), records it in the database
+// as SEEDING, and broadcasts a FILE_META gossip packet so remote peers can
+// pull it.
+//
+// This function blocks until the hash computation and broadcast are complete,
+// which for a large file may take several seconds.  The caller (IPC handler)
+// should run it in a goroutine if responsiveness matters.
+func (o *Orchestrator) PublishFile(localPath string) error {
+	// Resolve to an absolute path so the database record is stable even if the
+	// daemon's working directory changes.
+	absPath, err := filepath.Abs(localPath)
+	if err != nil {
+		return fmt.Errorf("publish: abs path: %w", err)
+	}
+
+	fi, err := os.Stat(absPath)
+	if err != nil {
+		return fmt.Errorf("publish: stat %s: %w", absPath, err)
+	}
+	if fi.IsDir() {
+		return fmt.Errorf("publish: %s is a directory; only files are supported", absPath)
+	}
+
+	// ── Streaming SHA-256 computation ─────────────────────────────────────────
+	// Open the file and feed it through sha256.New() in fixed-size chunks.
+	// At no point is the file content accumulated in a []byte.
+
+	f, err := os.Open(absPath)
+	if err != nil {
+		return fmt.Errorf("publish: open %s: %w", absPath, err)
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	buf := make([]byte, hashBufSize)
+	if _, err := io.CopyBuffer(h, f, buf); err != nil {
+		return fmt.Errorf("publish: hash %s: %w", absPath, err)
+	}
+
+	fileHash := fmt.Sprintf("%x", h.Sum(nil))
+	fileName := filepath.Base(absPath)
+
+	log.Printf("[sync] publishing %s (%s) hash=%s", fileName, humanSize(fi.Size()), fileHash)
+
+	// ── Persist as SEEDING ────────────────────────────────────────────────────
+
+	rec := models.FileRecord{
+		FileHash:  fileHash,
+		FileName:  fileName,
+		FileSize:  fi.Size(),
+		SenderID:  o.cfg.NodeID,
+		SenderIP:  "", // local node
+		SenderTCP: o.cfg.DaemonPortTCP,
+		LocalPath: absPath,
+		Status:    models.FileStatusSeeding,
+		Timestamp: time.Now().UnixNano(),
+	}
+
+	if err := o.store.InsertFileRecord(rec); err != nil && err != storage.ErrDuplicateFile {
+		return fmt.Errorf("publish: db insert: %w", err)
+	}
+
+	// ── Broadcast FILE_META ───────────────────────────────────────────────────
+
+	if o.gossip == nil {
+		log.Printf("[sync] gossip sender not set – skipping broadcast")
+		return nil
+	}
+
+	meta := models.FileMeta{
+		FileName: fileName,
+		FileSize: fi.Size(),
+		FileHash: fileHash,
+		TCPPort:  o.cfg.DaemonPortTCP,
+	}
+	payload, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("publish: marshal meta: %w", err)
+	}
+
+	pkt := models.Packet{
+		PacketID:  network.NewPacketID(),
+		SenderID:  o.cfg.NodeID,
+		Type:      models.PacketFileMeta,
+		Payload:   payload,
+		Timestamp: time.Now().UnixNano(),
+	}
+
+	if err := o.gossip.Send(pkt); err != nil {
+		return fmt.Errorf("publish: broadcast: %w", err)
+	}
+
+	log.Printf("[sync] ✓ FILE_META broadcast for %s", fileName)
+	return nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ResumePendingDownloads – called at daemon startup
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ResumePendingDownloads scans the database for any FileRecord that was left
+// in DOWNLOADING state (i.e. the daemon crashed mid-transfer) and resets them
+// to KNOWN so they are eligible for re-download on the next FILE_META receipt.
+// Records in FAILED state are left as-is; the user can inspect them via
+// --history.
+func (o *Orchestrator) ResumePendingDownloads() error {
+	downloading, err := o.store.ListFilesByStatus(models.FileStatusDownloading)
+	if err != nil {
+		return fmt.Errorf("resume: list downloading: %w", err)
+	}
+
+	for _, rec := range downloading {
+		log.Printf("[sync] resetting stale DOWNLOADING record for %s", rec.FileName)
+		if err := o.store.UpdateFileStatus(rec.FileHash, models.FileStatusKnown, ""); err != nil {
+			log.Printf("[sync] resume: reset %s: %v", rec.FileName, err)
+		}
+		// Remove any leftover .tmp file from the interrupted download.
+		tmpPath := filepath.Join(o.cfg.StorageDir, rec.FileName+".tmp")
+		if rmErr := os.Remove(tmpPath); rmErr == nil {
+			log.Printf("[sync] removed stale tmp file: %s", tmpPath)
+		}
+	}
+
+	return nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// humanSize formats a byte count into a human-readable string.
+func humanSize(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+}

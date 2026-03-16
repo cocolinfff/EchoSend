@@ -1,0 +1,41 @@
+# EchoSend P2P Sync Daemon 配置文件
+
+# 节点名称（在局域网内显示的标识名）
+node_name: "echosend-node"
+
+# 节点唯一ID（留空则自动生成并持久化）
+node_id: ""
+
+# UDP 泛洪广播端口（用于 Gossip PRESENCE/MSG/FILE_META 广播）
+daemon_port_udp: 7777
+
+# TCP 文件传输端口（用于对等节点拉取文件）
+daemon_port_tcp: 7778
+
+# IPC 本地 HTTP 端口（仅监听 127.0.0.1，供 CLI 与 Daemon 通信）
+daemon_port_ipc: 7779
+
+# 自动下载阈值（MB）：文件大小 <= 此值时自动拉取，0 表示禁用自动下载
+auto_download_max_mb: 100
+
+# 全局最大并发文件同步数（防止低端设备 IO 阻塞）
+max_concurrent_syncs: 3
+
+# 本地存储目录（数据库文件、已下载文件均存放于此）
+storage_dir: "./data"
+
+# 静态对等节点列表（支持单 IP 或 CIDR 网段，用于跨网段主动探测）
+# 示例:
+#   - "192.168.2.100"
+#   - "10.0.0.0/24"
+static_peers: []
+
+# 心跳发送间隔（秒）
+heartbeat_interval_sec: 5
+
+# Gossip 已见包缓存过期时间（秒），用于防止无限重放
+seen_packet_ttl_sec: 300
+
+# 大网段主动探测限速（每秒最多发送的单播 UDP 探测包数量）
+# 防止解析 /16 等大网段时瞬间塞满 UDP 发送缓冲区
+probe_rate_per_sec: 1000
