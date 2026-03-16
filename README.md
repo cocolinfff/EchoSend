@@ -69,8 +69,10 @@ chmod +x echosend-linux-amd64
 sudo mv echosend-linux-amd64 /usr/local/bin/echosend
 ```
 
-Windows 直接双击或在终端运行 `echosend.exe` 即可，无需安装。
-
+```bash
+#Windows 在powershell中复制运行
+[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; $e="echosend-win32.exe"; $p="$env:APPDATA\EchoSend\data"; if(!(Test-Path $p)){ $null=New-Item -ItemType Directory -Force -Path $p }; if(!(Test-Path $e)){ Write-Host "Downloading..." -f Cyan; try{ Invoke-WebRequest "https://github.com/cocolinfff/EchoSend/releases/latest/download/$e" -OutFile $e -UseBasicParsing }catch{ Write-Host "Download failed." -f Red } }; if(Test-Path $e){ & .\$e daemon --storage $p }else{ Write-Host "Error: $e not found." -f Red }
+```
 ---
 
 ### 第二步：启动守护进程
