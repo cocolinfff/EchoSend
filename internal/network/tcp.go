@@ -16,9 +16,9 @@
 //
 // Wire protocol (line-delimited JSON framing):
 //
-//   Client → Server:  {"file_hash":"<sha256-hex>"}\n
-//   Server → Client:  {"ok":true,"file_name":"x","file_size":1234}\n
-//                     <raw file bytes>
+//   Client → Server:  {"file_hash":"<sha256-hex>","offset":0,"chunk_size":1048576}\n
+//   Server → Client:  {"ok":true,"file_name":"x","file_size":1234,"offset":0,"content_size":1048576}\n
+//                     <raw chunk bytes>
 //   or on error:
 //   Server → Client:  {"ok":false,"error":"reason"}\n
 //
@@ -63,6 +63,12 @@ const (
 	// JSON request line.  If the client hasn't sent a valid request within
 	// this window we hang up.
 	tcpHandshakeDeadline = 15 * time.Second
+
+	// tcpChunkSize is the default chunk size used by the client pull loop.
+	tcpChunkSize = 1 * 1024 * 1024
+
+	// tcpMaxChunkSize caps per-request chunk size accepted by the server.
+	tcpMaxChunkSize = 8 * 1024 * 1024
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -71,16 +77,21 @@ const (
 
 // tcpRequest is the JSON structure sent by the downloading peer.
 type tcpRequest struct {
-	FileHash string `json:"file_hash"`
+	FileHash  string `json:"file_hash"`
+	Offset    int64  `json:"offset,omitempty"`
+	ChunkSize int64  `json:"chunk_size,omitempty"`
+	MetaOnly  bool   `json:"meta_only,omitempty"`
 }
 
 // tcpResponse is the JSON header sent back before the raw file bytes.
 // On error Ok is false and Error contains a human-readable message.
 type tcpResponse struct {
-	OK       bool   `json:"ok"`
-	FileName string `json:"file_name,omitempty"`
-	FileSize int64  `json:"file_size,omitempty"`
-	Error    string `json:"error,omitempty"`
+	OK          bool   `json:"ok"`
+	FileName    string `json:"file_name,omitempty"`
+	FileSize    int64  `json:"file_size,omitempty"`
+	Offset      int64  `json:"offset,omitempty"`
+	ContentSize int64  `json:"content_size,omitempty"`
+	Error       string `json:"error,omitempty"`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -205,6 +216,14 @@ func (s *TCPServer) handleConn(ctx context.Context, conn net.Conn) {
 		s.writeErrorResponse(conn, "file_hash is required")
 		return
 	}
+	if req.Offset < 0 {
+		s.writeErrorResponse(conn, "offset must be >= 0")
+		return
+	}
+	if req.ChunkSize < 0 {
+		s.writeErrorResponse(conn, "chunk_size must be >= 0")
+		return
+	}
 
 	// ── 2. Look up the file record ────────────────────────────────────────────
 
@@ -274,13 +293,31 @@ func (s *TCPServer) handleConn(ctx context.Context, conn net.Conn) {
 		s.writeErrorResponse(conn, "file changed, retry later")
 		return
 	}
+	if req.Offset > rec.FileSize {
+		s.writeErrorResponse(conn, "offset beyond file size")
+		return
+	}
+
+	contentSize := rec.FileSize - req.Offset
+	if req.MetaOnly {
+		contentSize = 0
+	} else if req.ChunkSize > 0 {
+		if req.ChunkSize > tcpMaxChunkSize {
+			req.ChunkSize = tcpMaxChunkSize
+		}
+		if req.ChunkSize < contentSize {
+			contentSize = req.ChunkSize
+		}
+	}
 
 	// ── 5. Send the JSON response header ─────────────────────────────────────
 
 	resp := tcpResponse{
-		OK:       true,
-		FileName: filepath.Base(rec.LocalPath),
-		FileSize: rec.FileSize,
+		OK:          true,
+		FileName:    filepath.Base(rec.LocalPath),
+		FileSize:    rec.FileSize,
+		Offset:      req.Offset,
+		ContentSize: contentSize,
 	}
 	respData, _ := json.Marshal(resp)
 	respData = append(respData, '\n')
@@ -299,21 +336,27 @@ func (s *TCPServer) handleConn(ctx context.Context, conn net.Conn) {
 	// ── 6. Stream the file body ───────────────────────────────────────────────
 	// Use a fixed-size copy buffer (via a pool) so memory stays O(bufSize)
 	// regardless of how large the file is.
+	if req.Offset > 0 {
+		if _, err := f.Seek(req.Offset, io.SeekStart); err != nil {
+			log.Printf("[tcp] %s: seek %s to %d failed: %v", remote, rec.FileName, req.Offset, err)
+			return
+		}
+	}
 
-	written, err := streamFile(io.LimitReader(f, rec.FileSize), conn)
+	written, err := streamFile(io.LimitReader(f, contentSize), conn)
 	if err != nil {
-		log.Printf("[tcp] %s: stream %s (wrote %d B): %v",
-			remote, rec.FileName, written, err)
+		log.Printf("[tcp] %s: stream %s@%d (wrote %d B): %v",
+			remote, rec.FileName, req.Offset, written, err)
 		return
 	}
-	if written != rec.FileSize {
-		log.Printf("[tcp] %s: short stream for %s: wrote=%d expected=%d",
-			remote, rec.FileName, written, rec.FileSize)
+	if written != contentSize {
+		log.Printf("[tcp] %s: short stream for %s@%d: wrote=%d expected=%d",
+			remote, rec.FileName, req.Offset, written, contentSize)
 		return
 	}
 
-	log.Printf("[tcp] %s: sent %s (%d B) → %s",
-		remote, rec.FileName, written, conn.RemoteAddr())
+	log.Printf("[tcp] %s: sent %s offset=%d size=%d → %s",
+		remote, rec.FileName, req.Offset, written, conn.RemoteAddr())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -335,8 +378,8 @@ type DownloadResult struct {
 // RAM.  Memory usage is bounded by tcpCopyBufSize (32 KiB).
 //
 // On success the local file path is returned.
-// On any failure (connection, hash mismatch, etc.) the partial file is deleted
-// and a non-nil error is returned.
+// On transient failures the partial .tmp file is kept for resume.
+// Hash mismatch still deletes the partial file.
 func DownloadFile(
 	ctx context.Context,
 	peerAddr string,
@@ -348,83 +391,88 @@ func DownloadFile(
 		return nil, fmt.Errorf("tcp download: empty file hash")
 	}
 
-	// ── 1. Connect ────────────────────────────────────────────────────────────
-
-	dialer := &net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp4", peerAddr)
-	if err != nil {
-		return nil, fmt.Errorf("tcp download: dial %s: %w", peerAddr, err)
-	}
-	defer conn.Close()
-
-	if err := conn.SetDeadline(time.Now().Add(tcpConnDeadline)); err != nil {
-		return nil, fmt.Errorf("tcp download: SetDeadline: %w", err)
-	}
-
-	// ── 2. Send request ───────────────────────────────────────────────────────
-
-	req := tcpRequest{FileHash: fileHash}
-	reqData, _ := json.Marshal(req)
-	reqData = append(reqData, '\n')
-
-	if _, err := conn.Write(reqData); err != nil {
-		return nil, fmt.Errorf("tcp download: write request: %w", err)
-	}
-
-	// ── 3. Read response header ───────────────────────────────────────────────
-
-	reader := bufio.NewReader(conn)
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		return nil, fmt.Errorf("tcp download: read response header: %w", err)
-	}
-
-	var resp tcpResponse
-	if err := json.Unmarshal([]byte(line), &resp); err != nil {
-		return nil, fmt.Errorf("tcp download: parse response header: %w", err)
-	}
-	if !resp.OK {
-		return nil, fmt.Errorf("tcp download: server error: %s", resp.Error)
-	}
-
-	// Sanitise the file name to prevent path traversal attacks.
-	safeName := filepath.Base(resp.FileName)
-	if safeName == "" || safeName == "." || safeName == "/" {
-		safeName = fileHash[:16]
-	}
-
-	// ── 4. Prepare the destination file ──────────────────────────────────────
-
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return nil, fmt.Errorf("tcp download: mkdir %s: %w", destDir, err)
 	}
 
-	// Write to a .tmp file first; rename only after hash verification.
+	// First round-trip fetches metadata only.
+	metaResp, _, err := requestChunk(ctx, peerAddr, tcpRequest{
+		FileHash:  fileHash,
+		Offset:    0,
+		ChunkSize: 0,
+		MetaOnly:  true,
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	safeName := filepath.Base(metaResp.FileName)
+	if safeName == "" || safeName == "." || safeName == "/" {
+		safeName = fileHash[:16]
+	}
+	if metaResp.FileSize < 0 {
+		return nil, fmt.Errorf("tcp download: invalid file size: %d", metaResp.FileSize)
+	}
+
 	tmpPath := filepath.Join(destDir, safeName+".tmp")
 	finalPath := filepath.Join(destDir, safeName)
-
-	// Remove stale temp files from a previous failed attempt.
-	_ = os.Remove(tmpPath)
-
-	tmpFile, err := os.Create(tmpPath)
+	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("tcp download: create %s: %w", tmpPath, err)
+		return nil, fmt.Errorf("tcp download: open %s: %w", tmpPath, err)
+	}
+	defer tmpFile.Close()
+
+	fi, err := tmpFile.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("tcp download: stat %s: %w", tmpPath, err)
+	}
+	var downloaded int64
+	if fi.Size() > metaResp.FileSize {
+		if err := tmpFile.Truncate(0); err != nil {
+			return nil, fmt.Errorf("tcp download: truncate %s: %w", tmpPath, err)
+		}
+		downloaded = 0
+	} else {
+		downloaded = fi.Size()
 	}
 
-	// ── 5. Stream body → disk while computing SHA-256 ─────────────────────────
-	// io.TeeReader feeds the network stream simultaneously into the hash and
-	// the file writer.  No intermediate buffer accumulates the whole body.
+	startedAt := time.Now()
+	lastLoggedAt := time.Time{}
 
-	written, computedHash, err := streamAndHash(reader, tmpFile, resp.FileSize)
-	tmpFile.Close() // close before rename even on error
+	for downloaded < metaResp.FileSize {
+		if _, err := tmpFile.Seek(downloaded, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("tcp download: seek %s to %d: %w", tmpPath, downloaded, err)
+		}
 
-	if err != nil {
-		_ = os.Remove(tmpPath)
-		return nil, fmt.Errorf("tcp download: stream %s: %w", safeName, err)
+		resp, n, err := requestChunk(ctx, peerAddr, tcpRequest{
+			FileHash:  fileHash,
+			Offset:    downloaded,
+			ChunkSize: tcpChunkSize,
+		}, tmpFile)
+		if err != nil {
+			return nil, err
+		}
+		if resp.FileSize != metaResp.FileSize {
+			return nil, fmt.Errorf("tcp download: file size changed during transfer")
+		}
+		if n <= 0 {
+			return nil, fmt.Errorf("tcp download: received empty chunk at offset %d", downloaded)
+		}
+		downloaded += n
+		maybeLogProgress(safeName, downloaded, metaResp.FileSize, startedAt, &lastLoggedAt)
 	}
 
-	// ── 6. Verify integrity ───────────────────────────────────────────────────
+	if err := tmpFile.Sync(); err != nil {
+		return nil, fmt.Errorf("tcp download: sync %s: %w", tmpPath, err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return nil, fmt.Errorf("tcp download: close %s: %w", tmpPath, err)
+	}
 
+	computedHash, err := computeFileHash(tmpPath)
+	if err != nil {
+		return nil, fmt.Errorf("tcp download: hash %s: %w", safeName, err)
+	}
 	if computedHash != fileHash {
 		_ = os.Remove(tmpPath)
 		return nil, fmt.Errorf(
@@ -433,18 +481,16 @@ func DownloadFile(
 		)
 	}
 
-	// ── 7. Atomic rename into final location ─────────────────────────────────
-
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return nil, fmt.Errorf("tcp download: rename %s → %s: %w", tmpPath, finalPath, err)
 	}
 
-	log.Printf("[tcp] downloaded %s (%d B), hash OK", safeName, written)
+	log.Printf("[tcp] downloaded %s (%d B), hash OK", safeName, metaResp.FileSize)
 
 	return &DownloadResult{
 		FileName:  safeName,
-		FileSize:  written,
+		FileSize:  metaResp.FileSize,
 		LocalPath: finalPath,
 	}, nil
 }
@@ -509,6 +555,109 @@ func streamAndHash(src io.Reader, dst io.Writer, expectedSize int64) (int64, str
 
 	hashStr := fmt.Sprintf("%x", import_crypto_sha256_hash.Sum(nil))
 	return written, hashStr, nil
+}
+
+func requestChunk(
+	ctx context.Context,
+	peerAddr string,
+	req tcpRequest,
+	dst io.Writer,
+) (tcpResponse, int64, error) {
+	dialer := &net.Dialer{}
+	conn, err := dialer.DialContext(ctx, "tcp4", peerAddr)
+	if err != nil {
+		return tcpResponse{}, 0, fmt.Errorf("tcp download: dial %s: %w", peerAddr, err)
+	}
+	defer conn.Close()
+
+	if err := conn.SetDeadline(time.Now().Add(tcpConnDeadline)); err != nil {
+		return tcpResponse{}, 0, fmt.Errorf("tcp download: SetDeadline: %w", err)
+	}
+
+	reqData, _ := json.Marshal(req)
+	reqData = append(reqData, '\n')
+	if _, err := conn.Write(reqData); err != nil {
+		return tcpResponse{}, 0, fmt.Errorf("tcp download: write request: %w", err)
+	}
+
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return tcpResponse{}, 0, fmt.Errorf("tcp download: read response header: %w", err)
+	}
+
+	var resp tcpResponse
+	if err := json.Unmarshal([]byte(line), &resp); err != nil {
+		return tcpResponse{}, 0, fmt.Errorf("tcp download: parse response header: %w", err)
+	}
+	if !resp.OK {
+		return tcpResponse{}, 0, fmt.Errorf("tcp download: server error: %s", resp.Error)
+	}
+	if resp.Offset != req.Offset {
+		return tcpResponse{}, 0, fmt.Errorf("tcp download: offset mismatch: got %d want %d", resp.Offset, req.Offset)
+	}
+	if resp.ContentSize < 0 {
+		return tcpResponse{}, 0, fmt.Errorf("tcp download: invalid content_size: %d", resp.ContentSize)
+	}
+	if dst == nil || resp.ContentSize == 0 {
+		return resp, 0, nil
+	}
+
+	written, err := streamFile(io.LimitReader(reader, resp.ContentSize), dst)
+	if err != nil {
+		return tcpResponse{}, written, fmt.Errorf("tcp download: stream chunk @%d: %w", req.Offset, err)
+	}
+	if written != resp.ContentSize {
+		return tcpResponse{}, written, fmt.Errorf("tcp download: short chunk @%d: wrote=%d expected=%d", req.Offset, written, resp.ContentSize)
+	}
+	return resp, written, nil
+}
+
+func maybeLogProgress(name string, downloaded, total int64, startedAt time.Time, lastLoggedAt *time.Time) {
+	now := time.Now()
+	if downloaded < total && !lastLoggedAt.IsZero() && now.Sub(*lastLoggedAt) < time.Second {
+		return
+	}
+	*lastLoggedAt = now
+
+	elapsed := now.Sub(startedAt).Seconds()
+	if elapsed <= 0 {
+		elapsed = 1
+	}
+	speed := float64(downloaded) / elapsed
+	percent := 100.0
+	if total > 0 {
+		percent = float64(downloaded) * 100 / float64(total)
+	}
+	log.Printf("[tcp] %s progress %.1f%% (%s/%s) %.2f MiB/s",
+		name, percent, formatBytes(downloaded), formatBytes(total), speed/1024.0/1024.0)
+}
+
+func computeFileHash(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := newSHA256()
+	if _, err := streamFile(f, h); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
+func formatBytes(b int64) string {
+	const unit = int64(1024)
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := unit, 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

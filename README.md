@@ -28,12 +28,14 @@ EchoSend 是一个用 **Go** 编写的单文件二进制工具，无需服务器
 - [快速开始](#快速开始)
 - [安装](#安装)
 - [CLI 参考](#cli-参考)
+  - [命令返回与打印结果（速查）](#命令返回与打印结果速查)
   - [daemon — 启动守护进程](#daemon--启动守护进程)
   - [--send — 发送消息或文件](#--send--发送消息或文件)
   - [--pull — 手动重拉文件](#--pull--手动重拉文件)
   - [--history — 查看历史](#--history--查看历史)
   - [--add — 添加静态节点](#--add--添加静态节点)
   - [status — 查看节点状态](#status--查看节点状态)
+  - [IPC API 调用与典型输出](#ipc-api-调用与典型输出)
 - [配置文件](#配置文件)
 - [后台运行](#后台运行)
 - [多实例 / 多网段](#多实例--多网段)
@@ -198,6 +200,32 @@ go build -ldflags "-X main.version=$(git describe --tags --always) -s -w" -o ech
 ## CLI 参考
 
 所有命令均支持 `--help` 查看详细说明。
+
+### 命令返回与打印结果（速查）
+
+> 说明：成功信息默认输出到 `stdout`，错误信息输出到 `stderr`，错误时进程返回非 0。
+
+| 命令 | 成功打印（示例） | 失败打印（示例） |
+|------|------------------|------------------|
+| `echosend daemon` | `EchoSend vX.Y.Z  node=alice  id=6bfaccd952fc…`<br>`UDP :7777   TCP :7778   IPC 127.0.0.1:7779`<br>`storage : ...`<br>`config  : ...` | `error: load config: ...`<br>`error: invalid configuration: ...`<br>`error: init daemon: ...` |
+| `echosend status` | `Node  : alice`<br>`ID    : ...`<br>`Peers : 2`<br>（随后打印 peer 表格） | `error: EchoSend daemon is not running ...`<br>`error: status: ...` |
+| `echosend --send -m "text"` | `✓ Message broadcast  id=<message-id>` | `error: --send requires -m <text> or -f <path>`<br>`error: -m and -f are mutually exclusive`<br>`error: send message: ...` |
+| `echosend --send -f ./a.bin` | `✓ File accepted for broadcast: a.bin`<br>`The daemon is hashing and will broadcast FILE_META to all peers.`<br>`Use --history to track progress.` | `error: file not found: ...`<br>`error: send file: ...` |
+| `echosend --pull <hash>` | `✓ Manual pull scheduled for hash: <hash>`<br>`Use --history to track download status changes.` | `error: --pull requires exactly one file hash argument`<br>`error: pull file: file hash not found in local history`<br>`error: pull file: file download already in progress` |
+| `echosend --add 192.168.2.50` | `✓ Static peer added: 192.168.2.50`<br>`Daemon will probe this target on the next heartbeat cycle.` | `error: --add requires a target IP or CIDR`<br>`error: add peer: ...` |
+| `echosend --history` | `─── History (newest first) ───`<br>`[timestamp] MSG ...` / `[timestamp] FILE ...` | `error: history: ...` |
+| `echosend --version` | `echosend vX.Y.Z (windows/amd64)` | - |
+
+Daemon 下载过程中的典型日志打印（用于观察分块、断点续传、速度）：
+
+```text
+[sync] manual pull scheduled: <file_hash> from 192.168.1.23:7778
+[sync] downloading firmware.bin from 192.168.1.23:7778
+[tcp] firmware.bin progress 12.5% (16.0 MiB/128.0 MiB) 9.41 MiB/s
+[tcp] firmware.bin progress 58.6% (75.0 MiB/128.0 MiB) 10.02 MiB/s
+[tcp] downloaded firmware.bin (134217728 B), hash OK
+[sync] ✓ firmware.bin saved to /data/firmware.bin (128.0 MiB)
+```
 
 ---
 
@@ -377,6 +405,67 @@ NAME     ID              IP             UDP    TCP    LAST SEEN
 bob      a1b2c3d4e5f6…  192.168.1.42   7777   7778   14:31:08
 charlie  9988776655aa…  192.168.1.55   7777   7778   14:30:52
 ```
+
+---
+
+### IPC API 调用与典型输出
+
+守护进程本地 IPC（仅 `127.0.0.1`）接口：
+
+- `POST /api/send/message`
+- `POST /api/send/file`
+- `POST /api/pull/file`
+- `POST /api/peers/add`
+- `GET /api/history?limit=50`
+- `GET /api/status`
+- `GET /api/ping`
+
+#### 1) 手动拉取文件（推荐用于失败重试/断点续传）
+
+```bash
+curl -sS -X POST "http://127.0.0.1:7779/api/pull/file" \
+  -H "Content-Type: application/json" \
+  -d '{"file_hash":"3f8a1c09b2d70b7e2dbd7f9fbd3e2cce8e8b6c63f2a4e3e0fd3af1c8a9d4b2ef"}'
+```
+
+可能返回（HTTP 202）：
+
+```json
+{
+  "ok": true,
+  "message": "manual pull scheduled for 3f8a1c09..."
+}
+```
+
+可能返回（HTTP 400）：
+
+```json
+{
+  "ok": false,
+  "message": "file download already in progress"
+}
+```
+
+#### 2) 获取历史（观察状态变化）
+
+```bash
+curl -sS "http://127.0.0.1:7779/api/history?limit=20"
+```
+
+文件状态会从 `[known]/[fail]` 进入 `[dl..]`，完成后变为 `[done]` 或 `[seed]`。
+
+#### 3) Daemon 典型日志（下载进度/速度/分块）
+
+```text
+[sync] manual pull scheduled: <file_hash> from 192.168.1.23:7778
+[sync] downloading firmware.bin from 192.168.1.23:7778
+[tcp] firmware.bin progress 12.5% (16.0 MiB/128.0 MiB) 9.41 MiB/s
+[tcp] firmware.bin progress 58.6% (75.0 MiB/128.0 MiB) 10.02 MiB/s
+[tcp] downloaded firmware.bin (134217728 B), hash OK
+[sync] ✓ firmware.bin saved to /data/firmware.bin (128.0 MiB)
+```
+
+若网络中断，下一次重试会继续使用同名 `.tmp` 文件中的已下载偏移继续拉取，而不是从 0 重新下载。
 
 ---
 
@@ -727,7 +816,7 @@ EchoSend/
 
 **Q: 文件下载到哪里？**
 
-下载到 `storage_dir` 目录（默认 `~/.echosend/data/`）。完整性校验失败的临时文件（`.tmp` 后缀）会被自动删除。
+下载到 `storage_dir` 目录（默认 `~/.echosend/data/`）。中断下载会保留 `.tmp` 以便断点续传；仅在完整性校验失败（Hash mismatch）时自动删除 `.tmp`。
 
 **Q: 节点重启后消息/文件记录会丢失吗？**
 

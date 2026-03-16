@@ -590,11 +590,7 @@ func (o *Orchestrator) ResumePendingDownloads() error {
 		if err := o.store.UpdateFileStatus(rec.FileHash, models.FileStatusKnown, ""); err != nil {
 			log.Printf("[sync] resume: reset %s: %v", rec.FileName, err)
 		}
-		// Remove any leftover .tmp file from the interrupted download.
-		tmpPath := filepath.Join(o.cfg.StorageDir, rec.FileName+".tmp")
-		if rmErr := os.Remove(tmpPath); rmErr == nil {
-			log.Printf("[sync] removed stale tmp file: %s", tmpPath)
-		}
+		// Keep .tmp so the next pull can resume from the persisted offset.
 	}
 
 	return nil
