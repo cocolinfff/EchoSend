@@ -15,7 +15,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"p2p-sync/internal/models"
@@ -316,41 +319,30 @@ func wrapConnErr(err error) error {
 	if err == nil {
 		return nil
 	}
-	// net/http wraps connection-refused errors inside *url.Error.
-	// We check the error string as a portable heuristic; on all tested
-	// platforms (Windows, Linux, macOS) refused connections produce messages
-	// containing "connection refused" or "actively refused".
-	msg := err.Error()
-	for _, needle := range []string{
-		"connection refused",
-		"actively refused",
-		"no connection could be made",
-		"EOF",
-		"context deadline exceeded",
-	} {
-		if contains(msg, needle) {
+
+	// Only map explicit connect failures to ErrDaemonNotRunning.
+	// Do not classify EOF/timeouts as daemon-not-running, because those can
+	// happen after the daemon already accepted and processed the request.
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		var opErr *net.OpError
+		if errors.As(urlErr.Err, &opErr) && opErr.Op == "dial" {
 			return ErrDaemonNotRunning
 		}
-	}
-	return err
-}
 
-// contains is a simple case-insensitive substring check used by wrapConnErr.
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr ||
-		len(s) > 0 && indexOfSubstr(s, substr) >= 0)
-}
-
-// indexOfSubstr returns the first index of substr in s, or -1 if not found.
-// We implement this locally to avoid importing strings just for one call.
-func indexOfSubstr(s, substr string) int {
-	if len(substr) == 0 {
-		return 0
-	}
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return i
+		msg := strings.ToLower(urlErr.Error())
+		for _, needle := range []string{
+			"connection refused",
+			"actively refused",
+			"no connection could be made",
+			"no such host",
+			"cannot assign requested address",
+		} {
+			if strings.Contains(msg, needle) {
+				return ErrDaemonNotRunning
+			}
 		}
 	}
-	return -1
+
+	return err
 }

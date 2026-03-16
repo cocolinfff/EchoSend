@@ -59,6 +59,11 @@ const (
 	// maxDownloadRetries is how many times a single file download is retried
 	// before the record is marked FAILED and abandoned.
 	maxDownloadRetries = 3
+
+	// autoToManualFailThreshold is how many exhausted auto-download sessions
+	// (each session already includes maxDownloadRetries attempts) are allowed
+	// before we stop auto-downloading that source/file and require manual pull.
+	autoToManualFailThreshold = 3
 )
 
 var (
@@ -101,6 +106,12 @@ type Orchestrator struct {
 	// never start two goroutines for the same file.
 	inFlightMu sync.Mutex
 	inFlight   map[string]struct{}
+
+	// auto-failover tracking: after repeated failed auto-download sessions for
+	// the same (sender, file name), we switch that key to manual-only mode.
+	autoModeMu      sync.Mutex
+	autoFailCount   map[string]int
+	manualOnlyAuto  map[string]struct{}
 }
 
 // New creates an Orchestrator.  gossip may be nil during unit tests (no
@@ -123,6 +134,9 @@ func New(cfg *config.Config, store *storage.Store, gossip GossipSender) *Orchest
 		gossip:   gossip,
 		sem:      sem,
 		inFlight: make(map[string]struct{}),
+
+		autoFailCount:  make(map[string]int),
+		manualOnlyAuto: make(map[string]struct{}),
 	}
 }
 
@@ -155,6 +169,17 @@ func (o *Orchestrator) HandleFileMeta(pkt models.Packet, from *net.UDPAddr) {
 		Timestamp: time.Now().UnixNano(),
 	}
 
+	if o.isManualOnlyForAuto(rec.SenderID, rec.FileName) {
+		// Persist metadata for visibility/history, but do not auto-download.
+		rec.Status = models.FileStatusFailed
+		if err := o.store.InsertFileRecord(rec); err != nil && err != storage.ErrDuplicateFile {
+			log.Printf("[sync] db insert file meta (manual-only): %v", err)
+		}
+		log.Printf("[sync] auto-download disabled for %s from %s after repeated failures; use --pull %s",
+			rec.FileName, rec.SenderID, rec.FileHash)
+		return
+	}
+
 	if err := o.store.InsertFileRecord(rec); err != nil {
 		if err == storage.ErrDuplicateFile {
 			log.Printf("[sync] already have %s – skipping", meta.FileName)
@@ -184,7 +209,7 @@ func (o *Orchestrator) HandleFileMeta(pkt models.Packet, from *net.UDPAddr) {
 	}
 	peerAddr := fmt.Sprintf("%s:%d", sourceIP, meta.TCPPort)
 
-	_ = o.startTrackedDownload(rec, peerAddr)
+	_ = o.startTrackedDownload(rec, peerAddr, true)
 }
 
 // PullFileByHash schedules a manual pull/retry for a file already present in
@@ -231,7 +256,7 @@ func (o *Orchestrator) PullFileByHash(fileHash string) error {
 	}
 	peerAddr := fmt.Sprintf("%s:%d", sourceIP, sourceTCP)
 
-	if err := o.startTrackedDownload(rec, peerAddr); err != nil {
+	if err := o.startTrackedDownload(rec, peerAddr, false); err != nil {
 		return err
 	}
 
@@ -240,7 +265,7 @@ func (o *Orchestrator) PullFileByHash(fileHash string) error {
 }
 
 // startTrackedDownload starts an async download for rec if it is not already in flight.
-func (o *Orchestrator) startTrackedDownload(rec models.FileRecord, peerAddr string) error {
+func (o *Orchestrator) startTrackedDownload(rec models.FileRecord, peerAddr string, autoTriggered bool) error {
 	o.inFlightMu.Lock()
 	if _, already := o.inFlight[rec.FileHash]; already {
 		o.inFlightMu.Unlock()
@@ -249,7 +274,7 @@ func (o *Orchestrator) startTrackedDownload(rec models.FileRecord, peerAddr stri
 	o.inFlight[rec.FileHash] = struct{}{}
 	o.inFlightMu.Unlock()
 
-	go o.downloadWithRetry(context.Background(), rec, peerAddr)
+	go o.downloadWithRetry(context.Background(), rec, peerAddr, autoTriggered)
 	return nil
 }
 
@@ -260,7 +285,7 @@ func (o *Orchestrator) startTrackedDownload(rec models.FileRecord, peerAddr stri
 // downloadWithRetry attempts to download rec from peerAddr up to
 // maxDownloadRetries times, with an exponential-ish back-off between attempts.
 // It acquires the semaphore before each attempt so the cap is always respected.
-func (o *Orchestrator) downloadWithRetry(ctx context.Context, rec models.FileRecord, peerAddr string) {
+func (o *Orchestrator) downloadWithRetry(ctx context.Context, rec models.FileRecord, peerAddr string, autoTriggered bool) {
 	defer func() {
 		// Always release the in-flight tracking entry, regardless of outcome.
 		o.inFlightMu.Lock()
@@ -306,6 +331,9 @@ func (o *Orchestrator) downloadWithRetry(ctx context.Context, rec models.FileRec
 	if err := o.store.UpdateFileStatus(rec.FileHash, models.FileStatusFailed, ""); err != nil {
 		log.Printf("[sync] db update status FAILED: %v", err)
 	}
+	if autoTriggered {
+		o.noteAutoFailure(rec)
+	}
 }
 
 // executeDownload performs one download attempt for rec from peerAddr.
@@ -339,10 +367,52 @@ func (o *Orchestrator) executeDownload(ctx context.Context, rec models.FileRecor
 	log.Printf("[sync] ✓ %s saved to %s (%s)",
 		result.FileName, result.LocalPath, humanSize(result.FileSize))
 
+	// Any successful download (automatic or manual) clears manual-only mode
+	// for this source/file so future updates can auto-sync again.
+	o.clearAutoFailure(rec)
+
 	// Re-broadcast the FILE_META so this node propagates the file further.
 	o.rebroadcastFileMeta(rec, result.LocalPath)
 
 	return nil
+}
+
+func autoKey(senderID, fileName string) string {
+	sid := strings.TrimSpace(senderID)
+	if sid == "" {
+		sid = "unknown"
+	}
+	name := strings.ToLower(strings.TrimSpace(fileName))
+	return sid + "|" + name
+}
+
+func (o *Orchestrator) isManualOnlyForAuto(senderID, fileName string) bool {
+	key := autoKey(senderID, fileName)
+	o.autoModeMu.Lock()
+	defer o.autoModeMu.Unlock()
+	_, blocked := o.manualOnlyAuto[key]
+	return blocked
+}
+
+func (o *Orchestrator) noteAutoFailure(rec models.FileRecord) {
+	key := autoKey(rec.SenderID, rec.FileName)
+	o.autoModeMu.Lock()
+	defer o.autoModeMu.Unlock()
+
+	o.autoFailCount[key]++
+	if o.autoFailCount[key] >= autoToManualFailThreshold {
+		o.manualOnlyAuto[key] = struct{}{}
+		log.Printf("[sync] auto->manual fallback enabled for %s from %s after %d failed sessions",
+			rec.FileName, rec.SenderID, o.autoFailCount[key])
+	}
+}
+
+func (o *Orchestrator) clearAutoFailure(rec models.FileRecord) {
+	key := autoKey(rec.SenderID, rec.FileName)
+	o.autoModeMu.Lock()
+	defer o.autoModeMu.Unlock()
+	delete(o.autoFailCount, key)
+	delete(o.manualOnlyAuto, key)
 }
 
 // rebroadcastFileMeta announces a newly completed download to the gossip mesh
