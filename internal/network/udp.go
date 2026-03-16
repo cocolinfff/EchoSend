@@ -332,6 +332,34 @@ func (e *UDPEngine) Send(pkt models.Packet) error {
 	return nil
 }
 
+// SendTo serialises pkt and sends it to a single UDP endpoint (host:port).
+// It still stamps default packet fields and marks PacketID as seen locally so
+// reflected copies are ignored by this node.
+func (e *UDPEngine) SendTo(pkt models.Packet, addr string) error {
+	if pkt.SenderID == "" {
+		pkt.SenderID = e.selfID
+	}
+	if pkt.Timestamp == 0 {
+		pkt.Timestamp = time.Now().UnixNano()
+	}
+	if pkt.TTL == 0 {
+		pkt.TTL = defaultGossipTTL
+	}
+	if pkt.SenderIP == "" {
+		if len(e.localIPs) > 0 {
+			pkt.SenderIP = e.localIPs[0]
+		}
+	}
+
+	data, err := json.Marshal(pkt)
+	if err != nil {
+		return fmt.Errorf("udp: marshal packet: %w", err)
+	}
+
+	e.markSeen(pkt.PacketID)
+	return e.sendRaw(data, addr)
+}
+
 // sendRaw writes data to the given "host:port" UDP address.
 // It borrows a connection from the pool (or simply uses WriteTo on e.conn).
 func (e *UDPEngine) sendRaw(data []byte, addr string) error {

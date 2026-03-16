@@ -24,6 +24,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sort"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,6 +35,12 @@ import (
 	"p2p-sync/internal/models"
 	"p2p-sync/internal/network"
 	"p2p-sync/internal/storage"
+)
+
+const (
+	syncHistoryDefaultLimit = 200
+	syncRequestMinInterval  = 20 * time.Second
+	syncResponseMinInterval = 20 * time.Second
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -50,6 +58,10 @@ type Daemon struct {
 	tcp    *network.TCPServer
 	syncer *filesync.Orchestrator
 	ipcSrv *ipc.Server
+
+	syncMu         sync.Mutex
+	lastSyncReqAt  time.Time
+	lastSyncRespAt map[string]time.Time
 }
 
 // New constructs a Daemon from the given config.  Storage is opened
@@ -88,6 +100,8 @@ func New(cfg *config.Config) (*Daemon, error) {
 		tcp:    tcpServer,
 		syncer: syncer,
 		ipcSrv: ipcServer,
+
+		lastSyncRespAt: make(map[string]time.Time),
 	}
 
 	// ── 7. Register UDP packet handlers ──────────────────────────────────────
@@ -152,6 +166,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	log.Printf("[daemon] IPC HTTP    → 127.0.0.1:%d", d.cfg.DaemonPortIPC)
 	log.Printf("[daemon] storage dir → %s", d.cfg.StorageDir)
 
+	// Ask online peers to replay recent history so newly started or previously
+	// offline nodes can quickly rebuild message/file history.
+	d.maybeRequestHistorySync("daemon startup")
+
 	// ── Block until shutdown ──────────────────────────────────────────────────
 	select {
 	case sig := <-sigCh:
@@ -194,8 +212,7 @@ func (d *Daemon) registerHandlers() {
 		case models.PacketFileMeta:
 			d.syncer.HandleFileMeta(pkt, from)
 		case models.PacketSyncReq:
-			// Reserved for future use (e.g. explicit pull requests).
-			log.Printf("[daemon] SYNC_REQ from %s (not yet implemented)", pkt.SenderID)
+			d.handleSyncRequest(pkt, from)
 		default:
 			log.Printf("[daemon] unknown packet type %q from %s", pkt.Type, pkt.SenderID)
 		}
@@ -239,6 +256,10 @@ func (d *Daemon) handlePresence(pkt models.Packet, from *net.UDPAddr) {
 		log.Printf("[daemon] new peer discovered: %s (%s) at %s:%d",
 			node.NodeName, node.NodeID[:8], node.IP, node.UDPPort)
 	}
+
+	// A peer heartbeat means someone is online; request history (throttled) so
+	// this node can catch up after fresh install/restart/offline periods.
+	d.maybeRequestHistorySync("peer presence")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -282,6 +303,168 @@ func (d *Daemon) handleMessage(pkt models.Packet, from *net.UDPAddr) {
 	default:
 		log.Printf("[daemon] store message from %s: %v", pkt.SenderID, err)
 	}
+}
+
+// handleSyncRequest replays recent local history to the requester via unicast.
+func (d *Daemon) handleSyncRequest(pkt models.Packet, from *net.UDPAddr) {
+	if from == nil {
+		return
+	}
+
+	req := models.SyncRequest{}
+	if err := json.Unmarshal(pkt.Payload, &req); err != nil {
+		// Backward compatibility: if payload is absent/malformed, fall back to
+		// packet sender identity and default limit.
+		req.RequesterID = pkt.SenderID
+	}
+	if req.RequesterID == "" {
+		req.RequesterID = pkt.SenderID
+	}
+	if req.RequesterID == "" || req.RequesterID == d.cfg.NodeID {
+		return
+	}
+	if req.Limit <= 0 || req.Limit > syncHistoryDefaultLimit {
+		req.Limit = syncHistoryDefaultLimit
+	}
+
+	if !d.shouldRespondSync(req.RequesterID) {
+		return
+	}
+
+	target := from.String()
+	msgCount := d.replayMessagesTo(target, req.Limit)
+	fileCount := d.replayFilesTo(target, req.Limit)
+
+	log.Printf("[daemon] replayed history to %s: messages=%d files=%d",
+		req.RequesterID, msgCount, fileCount)
+}
+
+func (d *Daemon) maybeRequestHistorySync(reason string) {
+	d.syncMu.Lock()
+	if time.Since(d.lastSyncReqAt) < syncRequestMinInterval {
+		d.syncMu.Unlock()
+		return
+	}
+	d.lastSyncReqAt = time.Now()
+	d.syncMu.Unlock()
+
+	req := models.SyncRequest{
+		RequesterID: d.cfg.NodeID,
+		Limit:       syncHistoryDefaultLimit,
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return
+	}
+
+	pkt := models.Packet{
+		PacketID:  network.NewPacketID(),
+		SenderID:  d.cfg.NodeID,
+		Type:      models.PacketSyncReq,
+		Payload:   payload,
+		Timestamp: time.Now().UnixNano(),
+	}
+
+	if err := d.udp.Send(pkt); err != nil {
+		log.Printf("[daemon] SYNC_REQ send failed (%s): %v", reason, err)
+		return
+	}
+	log.Printf("[daemon] SYNC_REQ broadcast (%s)", reason)
+}
+
+func (d *Daemon) shouldRespondSync(requesterID string) bool {
+	d.syncMu.Lock()
+	defer d.syncMu.Unlock()
+
+	last, ok := d.lastSyncRespAt[requesterID]
+	if ok && time.Since(last) < syncResponseMinInterval {
+		return false
+	}
+	d.lastSyncRespAt[requesterID] = time.Now()
+	return true
+}
+
+func (d *Daemon) replayMessagesTo(addr string, limit int) int {
+	msgs, err := d.store.ListMessages(limit)
+	if err != nil {
+		log.Printf("[daemon] replay messages list: %v", err)
+		return 0
+	}
+
+	sent := 0
+	for _, msg := range msgs {
+		payload, err := json.Marshal(msg)
+		if err != nil {
+			continue
+		}
+		packetID := msg.MessageID
+		if packetID == "" {
+			packetID = network.NewPacketID()
+		}
+		pkt := models.Packet{
+			PacketID:  packetID,
+			SenderID:  d.cfg.NodeID,
+			Type:      models.PacketMsg,
+			Payload:   payload,
+			Timestamp: msg.Timestamp,
+		}
+		if err := d.udp.SendTo(pkt, addr); err == nil {
+			sent++
+		}
+	}
+	return sent
+}
+
+func (d *Daemon) replayFilesTo(addr string, limit int) int {
+	seeding, err := d.store.ListFilesByStatus(models.FileStatusSeeding)
+	if err != nil {
+		log.Printf("[daemon] replay files list seeding: %v", err)
+		return 0
+	}
+	complete, err := d.store.ListFilesByStatus(models.FileStatusComplete)
+	if err != nil {
+		log.Printf("[daemon] replay files list complete: %v", err)
+		return 0
+	}
+
+	all := make([]models.FileRecord, 0, len(seeding)+len(complete))
+	all = append(all, seeding...)
+	all = append(all, complete...)
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].Timestamp > all[j].Timestamp
+	})
+	if limit > 0 && len(all) > limit {
+		all = all[:limit]
+	}
+
+	sent := 0
+	for _, rec := range all {
+		if rec.FileHash == "" || rec.FileName == "" || rec.FileSize <= 0 {
+			continue
+		}
+		meta := models.FileMeta{
+			FileName: rec.FileName,
+			FileSize: rec.FileSize,
+			FileHash: rec.FileHash,
+			TCPPort:  d.cfg.DaemonPortTCP,
+		}
+		payload, err := json.Marshal(meta)
+		if err != nil {
+			continue
+		}
+		pkt := models.Packet{
+			PacketID:  network.NewPacketID(),
+			SenderID:  d.cfg.NodeID,
+			Type:      models.PacketFileMeta,
+			Payload:   payload,
+			Timestamp: rec.Timestamp,
+		}
+		if err := d.udp.SendTo(pkt, addr); err == nil {
+			sent++
+		}
+	}
+
+	return sent
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
