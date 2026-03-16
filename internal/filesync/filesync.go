@@ -26,12 +26,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -57,6 +59,15 @@ const (
 	// maxDownloadRetries is how many times a single file download is retried
 	// before the record is marked FAILED and abandoned.
 	maxDownloadRetries = 3
+)
+
+var (
+	// ErrManualPullNotFound means the requested file hash does not exist in local metadata.
+	ErrManualPullNotFound = errors.New("file hash not found in local history")
+	// ErrManualPullNoSource means we have metadata but no reachable source endpoint.
+	ErrManualPullNoSource = errors.New("no source peer available for this file")
+	// ErrManualPullInFlight means this hash is already downloading.
+	ErrManualPullInFlight = errors.New("file download already in progress")
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -166,15 +177,6 @@ func (o *Orchestrator) HandleFileMeta(pkt models.Packet, from *net.UDPAddr) {
 		return
 	}
 
-	// Ensure we don't start a duplicate goroutine for the same hash.
-	o.inFlightMu.Lock()
-	if _, already := o.inFlight[meta.FileHash]; already {
-		o.inFlightMu.Unlock()
-		return
-	}
-	o.inFlight[meta.FileHash] = struct{}{}
-	o.inFlightMu.Unlock()
-
 	// Determine the source address for the TCP pull.
 	sourceIP := pkt.SenderIP
 	if sourceIP == "" && from != nil {
@@ -182,8 +184,73 @@ func (o *Orchestrator) HandleFileMeta(pkt models.Packet, from *net.UDPAddr) {
 	}
 	peerAddr := fmt.Sprintf("%s:%d", sourceIP, meta.TCPPort)
 
-	// Dispatch download asynchronously.
+	_ = o.startTrackedDownload(rec, peerAddr)
+}
+
+// PullFileByHash schedules a manual pull/retry for a file already present in
+// local history metadata. The operation is asynchronous and returns once the
+// download goroutine has been queued.
+func (o *Orchestrator) PullFileByHash(fileHash string) error {
+	fileHash = strings.TrimSpace(fileHash)
+	if fileHash == "" {
+		return ErrManualPullNotFound
+	}
+
+	rec, found, err := o.store.GetFile(fileHash)
+	if err != nil {
+		return fmt.Errorf("manual pull: load file record: %w", err)
+	}
+	if !found {
+		return ErrManualPullNotFound
+	}
+
+	sourceIP := strings.TrimSpace(rec.SenderIP)
+	sourceTCP := rec.SenderTCP
+
+	if (sourceIP == "" || sourceTCP <= 0) && rec.SenderID != "" {
+		node, ok, nodeErr := o.store.GetNode(rec.SenderID)
+		if nodeErr != nil {
+			return fmt.Errorf("manual pull: load sender node: %w", nodeErr)
+		}
+		if ok {
+			if sourceIP == "" {
+				sourceIP = strings.TrimSpace(node.IP)
+			}
+			if sourceTCP <= 0 {
+				sourceTCP = node.TCPPort
+			}
+		}
+	}
+
+	if sourceIP == "" || sourceTCP <= 0 {
+		return ErrManualPullNoSource
+	}
+
+	if rec.FileHash == "" {
+		rec.FileHash = fileHash
+	}
+	peerAddr := fmt.Sprintf("%s:%d", sourceIP, sourceTCP)
+
+	if err := o.startTrackedDownload(rec, peerAddr); err != nil {
+		return err
+	}
+
+	log.Printf("[sync] manual pull scheduled: %s from %s", rec.FileHash, peerAddr)
+	return nil
+}
+
+// startTrackedDownload starts an async download for rec if it is not already in flight.
+func (o *Orchestrator) startTrackedDownload(rec models.FileRecord, peerAddr string) error {
+	o.inFlightMu.Lock()
+	if _, already := o.inFlight[rec.FileHash]; already {
+		o.inFlightMu.Unlock()
+		return ErrManualPullInFlight
+	}
+	o.inFlight[rec.FileHash] = struct{}{}
+	o.inFlightMu.Unlock()
+
 	go o.downloadWithRetry(context.Background(), rec, peerAddr)
+	return nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

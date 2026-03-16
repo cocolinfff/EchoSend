@@ -1,0 +1,92 @@
+name: Manual Build and Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: manual-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve next version (auto +0.0.1)
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+
+          latest_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1 || true)"
+
+          if [[ -z "${latest_tag}" ]]; then
+            next_version="v0.0.1"
+          else
+            ver="${latest_tag#v}"
+            IFS='.' read -r major minor patch <<< "${ver}"
+            patch=$((patch + 1))
+            next_version="v${major}.${minor}.${patch}"
+          fi
+
+          echo "latest_tag=${latest_tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${next_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Build binaries
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          build() {
+            local goos="$1"
+            local goarch="$2"
+            local out="$3"
+
+            echo "Building ${out} (${goos}/${goarch})"
+            GOOS="${goos}" GOARCH="${goarch}" CGO_ENABLED=0 \
+              go build -trimpath -ldflags "-X main.version=${VERSION} -s -w" -o "dist/${out}" .
+          }
+
+          build windows amd64 echosend-win64.exe
+          build windows 386   echosend-win32.exe
+          build linux   amd64 echosend-linux64
+          build linux   386   echosend-linux32
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/echosend-win64.exe
+            dist/echosend-win32.exe
+            dist/echosend-linux64
+            dist/echosend-linux32
+            dist/SHA256SUMS.txt

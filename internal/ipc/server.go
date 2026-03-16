@@ -14,6 +14,7 @@
 //
 //	POST /api/send/message   – broadcast a text message to the LAN mesh
 //	POST /api/send/file      – hash a local file and broadcast its FILE_META
+//	POST /api/pull/file      – manually pull/retry a file by SHA-256 hash
 //	POST /api/peers/add      – add a static peer (IP or CIDR) to the config
 //	GET  /api/history        – return messages + file records (newest first)
 //	GET  /api/status         – return node ID, name and known-peer list
@@ -43,6 +44,7 @@ import (
 // Defined here as an interface to avoid an import cycle.
 type FilePublisher interface {
 	PublishFile(localPath string) error
+	PullFileByHash(fileHash string) error
 }
 
 // GossipSender is implemented by network.UDPEngine.
@@ -99,6 +101,7 @@ func NewServer(
 	mux.HandleFunc("/api/ping", s.handlePing)
 	mux.HandleFunc("/api/send/message", s.handleSendMessage)
 	mux.HandleFunc("/api/send/file", s.handleSendFile)
+	mux.HandleFunc("/api/pull/file", s.handlePullFile)
 	mux.HandleFunc("/api/peers/add", s.handleAddPeer)
 	mux.HandleFunc("/api/history", s.handleHistory)
 	mux.HandleFunc("/api/status", s.handleStatus)
@@ -257,6 +260,38 @@ func (s *Server) handleSendFile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, models.IPCReply{
 		OK:      true,
 		Message: fmt.Sprintf("hashing and broadcasting %s (asynchronous)", req.Path),
+	})
+}
+
+// handlePullFile triggers a manual pull/retry download by file hash.
+//
+//	POST /api/pull/file
+//	Body: {"file_hash": "<sha256-hex>"}
+func (s *Server) handlePullFile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errorReply("method not allowed"))
+		return
+	}
+
+	var req models.IPCPullFileReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorReply(err.Error()))
+		return
+	}
+	if req.FileHash == "" {
+		writeJSON(w, http.StatusBadRequest, errorReply("file_hash must not be empty"))
+		return
+	}
+
+	if err := s.publisher.PullFileByHash(req.FileHash); err != nil {
+		log.Printf("[ipc] pull file %s: %v", req.FileHash, err)
+		writeJSON(w, http.StatusBadRequest, errorReply(err.Error()))
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, models.IPCReply{
+		OK:      true,
+		Message: fmt.Sprintf("manual pull scheduled for %s", req.FileHash),
 	})
 }
 

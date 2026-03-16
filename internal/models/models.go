@@ -122,6 +122,12 @@ type IPCSendFileReq struct {
 	Path string `json:"path"`
 }
 
+// IPCPullFileReq is the JSON body for POST /api/pull/file.
+// FileHash is the SHA-256 identifier of the file to re-download.
+type IPCPullFileReq struct {
+	FileHash string `json:"file_hash"`
+}
+
 // IPCAddPeerReq is the JSON body for POST /api/peers/add.
 // Target 可以是单 IP（如 "192.168.1.100"）或 CIDR（如 "10.0.0.0/24"）。
 type IPCAddPeerReq struct {

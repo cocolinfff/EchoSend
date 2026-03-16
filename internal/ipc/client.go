@@ -149,6 +149,27 @@ func (c *Client) SendFile(localPath string) error {
 	return nil
 }
 
+// PullFileByHash asks the daemon to manually pull/retry a file by SHA-256 hash.
+// The daemon schedules the pull asynchronously and returns immediately.
+func (c *Client) PullFileByHash(fileHash string) error {
+	body := models.IPCPullFileReq{FileHash: fileHash}
+
+	resp, err := c.postJSON("/api/pull/file", body)
+	if err != nil {
+		return wrapConnErr(err)
+	}
+	defer resp.Body.Close()
+
+	var reply models.IPCReply
+	if err := json.NewDecoder(resp.Body).Decode(&reply); err != nil {
+		return fmt.Errorf("pull file: decode response: %w", err)
+	}
+	if !reply.OK {
+		return fmt.Errorf("pull file: %s", reply.Message)
+	}
+	return nil
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Add peer
 // ─────────────────────────────────────────────────────────────────────────────
